@@ -1,0 +1,612 @@
+#!/usr/bin/env perl
+
+use strict;
+use Getopt::Long;
+use DBI;
+use Regexp::Wildcards;
+use DBD::Pg;
+use File::Basename;
+use File::Path qw(make_path);
+
+our $VERSION = '0.1';
+our $NAME = 'whiskeytap';
+
+Getopt::Long::Configure(qw(no_ignore_case bundling));
+
+my $opts = {wildcard => 'unix'};
+
+Getopt::Long::GetOptions(
+  'dbname|d=s'          => \$opts->{dbname},
+  'username|U=s'        => \$opts->{username},
+  'host|h=s'            => \$opts->{host},
+  'port|p=s'            => \$opts->{port},
+  'connect|c=s'         => \$opts->{connect},
+  'schema|n=s@'         => \$opts->{schema},
+  'exclude-schema|N=s@' => \$opts->{exclude_schema},
+  'table|t=s@'          => \$opts->{table},
+  'exclude-table|T=s@'  => \$opts->{exclude_table},
+  'use-schemas|s'       => \$opts->{use_schemas},
+  'exclude-check|x=s@'  => \$opts->{exclude_check},
+  'wildcard|w=s'        => \$opts->{wildcard},
+  'prefix|o=s'          => \$opts->{prefix},
+  'version|V'           => \$opts->{version},
+  'help|H|?'            => \$opts->{help},
+  'man|m'               => \$opts->{man},
+) or require Pod::Usage && Pod::Usage::pod2usage(2);
+
+if ($opts->{version}) {
+  print $NAME, ' ', main->VERSION, $/;
+  exit;
+}
+
+if ($opts->{help} or $opts->{man}) {
+  require Pod::Usage;
+  Pod::Usage::pod2usage(
+    '-sections' => $opts->{man} ? '.+' : '(?i:(Usage|Options))',
+    '-verbose'  => 99,
+    '-exitval'  => 0,
+  );
+}
+
+
+# Work out how to connect to the database
+my $connstring;
+if (defined $opts->{connect}) {
+  $connstring = $opts->{connect};
+} else {
+  my @c;
+  foreach my $flag (qw(dbname host port)) {
+    push @c, "$flag=$opts->{$flag}" if defined $opts->{$flag};
+  }
+  $connstring = 'dbi:Pg:' . join(';', @c);
+}
+
+my $dbh = DBI->connect($connstring,
+                       $opts->{username},
+                       '',
+                       {AutoCommit => 0, RaiseError => 1}) or die $DBI::errstr;
+
+# Create our output directory, if needed
+
+if(defined $opts->{prefix}) {
+  my $dir = dirname($opts->{prefix});
+  -d $dir || make_path($dir);
+}
+
+my $printschema = 0;
+my $currenttable;
+my $currentschema;
+my $currentname;
+my @currenttests;
+my $tablecomment;
+my $testcount;
+my $excludechecks;
+my %namecount;
+my %global;
+
+eval {
+  # Get some basic data we need
+  my ($dbuser) = $dbh->selectrow_array('select user');
+  # Non-system schemas that are in the search path
+  my ($dbschemas) = $dbh->selectrow_array('select current_schemas(false)');
+
+  # Convert --table and --exclude-table etc. to regexps
+  my $wc2re = Regexp::Wildcards->new(type => $opts->{wildcard});
+  my $includetables = flags_to_regex($opts->{table}, '.');
+  my $excludetables = flags_to_regex($opts->{exclude_table}, '(?!)');
+  my $includeschemas;
+  if (defined $opts->{schema}) {
+    $includeschemas = flags_to_regex($opts->{schema}, '.');
+  } else {
+    # If there are wildcard characters in your schema names, don't do that
+    $includeschemas = flags_to_regex($dbschemas, '.');
+  }
+  my $excludeschemas = flags_to_regex($opts->{exclude_schema}, '(?!)');
+  $excludechecks = flags_to_regex($opts->{exclude_check}, '(?!)');
+
+  # Decide whether to include schemas in output
+  if (defined $opts->{show_schemas}) {
+    $printschema = $opts->{show_schemas};
+  } elsif (defined $opts->{schema} || scalar @$dbschemas > 1) {
+    $printschema = 1;
+  }
+
+  # Trundle through all the tables and views
+  my $tableh = $dbh->table_info(undef, undef, undef, 'TABLE,VIEW,MATERIALIZED VIEW');
+
+  my @tables;
+  for my $rel (@{$tableh->fetchall_arrayref({})}) {
+    next if $rel->{TABLE_SCHEM} =~ $excludeschemas;
+    next unless $rel->{TABLE_SCHEM} =~ $includeschemas;
+    next if $rel->{TABLE_NAME} =~ $excludetables;
+    next unless $rel->{TABLE_NAME} =~ $includetables;
+    $namecount{$rel->{TABLE_NAME}}++;
+    push @tables, $rel;
+  }
+  for my $rel (@tables) {
+    start_table($rel->{TABLE_SCHEM}, $rel->{TABLE_NAME});
+    my ($schemaoid) = $dbh->selectrow_array("select oid from pg_catalog.pg_namespace where nspname = ?", {}, $rel->{TABLE_SCHEM});
+    my ($tableoid) = $dbh->selectrow_array("select oid from pg_catalog.pg_class where relname = ? and relnamespace = ?", {}, $rel->{TABLE_NAME}, $schemaoid);
+    my $tabletype = $rel->{TABLE_TYPE};
+    push @{$global{$tabletype}->{$rel->{TABLE_SCHEM}}}, $rel->{TABLE_NAME};
+    my $istable = 1;
+    if ($tabletype eq 'TABLE') {
+      add_st_test('has_table');
+    } elsif ($tabletype eq 'VIEW') {
+      add_st_test('has_view');
+      $istable = 0;
+    } elsif ($tabletype eq 'MATERIALIZED VIEW') {
+      add_st_test('has_materialized_view');
+    }
+    $tablecomment = $rel->{REMARKS};
+
+    # Check columns
+    my $colh = $dbh->column_info(undef, $rel->{TABLE_SCHEM}, $rel->{TABLE_NAME}, '%');
+    my @cols = @{$colh->fetchall_arrayref({})};
+    my @colnames = map { $_->{COLUMN_NAME} } @cols;
+    add_st_test('columns_are', \@colnames);
+    for my $col (@cols) {
+      my $name = $col->{COLUMN_NAME};
+      add_break();
+      add_st_test('has_column', $name);
+      add_st_test('col_type_is', $name, $col->{pg_type});
+      if ($col->{NULLABLE} == 0) {
+        add_st_test('col_not_null', $name);
+      } elsif ($col->{NULLABLE} == 1) {
+        add_st_test('col_is_null', $name);
+      }
+      if (defined $col->{COLUMN_DEF}) {
+        add_st_test('col_default_is', $name, $col->{COLUMN_DEF});
+      } else {
+        add_st_test('col_hasnt_default', $name);
+      }
+    }
+
+    if ($istable) {
+      # Primary key
+      my @pk = $dbh->primary_key(undef, $rel->{TABLE_SCHEM}, $rel->{TABLE_NAME});
+      if (@pk == 0) {
+        add_st_test('hasnt_pk');
+      } elsif (@pk == 1) {
+        add_st_test('col_is_pk', $pk[0]);
+      } else {
+        add_st_test('col_is_pk', \@pk);
+      }
+      add_break();
+      # Foreign keys from this table
+      my $fkh = $dbh->foreign_key_info(undef, undef, undef,
+                                       undef, $rel->{TABLE_SCHEM}, $rel->{TABLE_NAME});
+      if (defined $fkh) {
+        my %f;
+        for my $fk (@{$fkh->fetchall_arrayref({})}) {
+          $f{$fk->{FK_NAME}}{fkschema} = $fk->{FK_TABLE_SCHEM};
+          $f{$fk->{FK_NAME}}{fktable} = $fk->{FK_TABLE_NAME};
+          $f{$fk->{FK_NAME}}{pkschema} = $fk->{UK_TABLE_SCHEM};
+          $f{$fk->{FK_NAME}}{pktable} = $fk->{UK_TABLE_NAME};
+          $f{$fk->{FK_NAME}}{fk}{$fk->{ORDINAL_POSITION}} = [$fk->{UK_COLUMN_NAME}, $fk->{FK_COLUMN_NAME}];
+        }
+        while(my ($name, $d) = each %f) {
+          my @cols = sort {$a <=> $b} keys %{$d->{fk}};
+          my (@pcol, @fcol);
+          foreach my $col (@cols) {
+            push @pcol, $d->{fk}{$col}[0];
+            push @fcol, $d->{fk}{$col}[1];
+          }
+          my @args;
+          push @args, 'fk_ok';
+          push @args, $d->{fkschema} if $printschema;
+          push @args, $d->{fktable};
+          if (@cols > 1) {
+            push @args, \@fcol;
+          } else {
+            push @args, $fcol[0];
+          }
+          push @args, $d->{pkschema} if $printschema;
+          push @args, $d->{pktable};
+          if (@cols > 1) {
+            push @args, \@pcol;
+          } else {
+            push @args, $pcol[0];
+          }
+          add_test_params(@args);
+        }
+      }
+
+      # Indexes
+      add_break();
+      my $sql = <<"GETINDEXES";
+      SELECT pg_get_indexdef(idx.indexrelid) as indexdef,
+       ns.nspname as schema,
+       i.relname as indname,
+       idx.indrelid::regclass as tablename,
+       am.amname as indam,
+       ARRAY(
+       SELECT pg_get_indexdef(idx.indexrelid, k + 1, true)
+       FROM generate_subscripts(idx.indkey, 1) as k
+       ORDER BY k
+       ) as indkey_names,
+       idx.indexprs IS NOT NULL as indexprs,
+       idx.indpred IS NOT NULL as indpred
+FROM   pg_index as idx
+JOIN   pg_class as i
+ON     i.oid = idx.indexrelid
+AND    idx.indrelid::regclass::text = ?
+JOIN   pg_am as am
+ON     i.relam = am.oid
+JOIN   pg_namespace as ns
+ON     ns.oid = i.relnamespace
+AND    ns.nspname = ?
+GETINDEXES
+      my @idxes = @{$dbh->selectall_arrayref($sql, {Slice => {}}, $rel->{TABLE_NAME}, $rel->{TABLE_SCHEM})};
+      add_st_test('indexes_are', [map {$_->{indname}} @idxes]);
+      for my $index (@idxes) {
+#        add_comment($index->{indexdef});
+        add_st_test('has_index', $index->{indname}, $index->{indkey_names});
+      }
+      add_break();
+
+      # Triggers
+      my $sql = << "GETTRIGGERS";
+select quote_ident(t.tgname) as name, quote_ident(ni.nspname) as schema, quote_ident(p.proname) as function
+  from pg_catalog.pg_trigger t
+  join pg_catalog.pg_class ct     on ct.oid = t.tgrelid
+  join pg_catalog.pg_namespace nt on nt.oid = ct.relnamespace
+  join pg_catalog.pg_proc p       on p.oid = t.tgfoid
+  join pg_catalog.pg_namespace ni on ni.oid = p.pronamespace
+ where t.tgrelid = ? and not t.tgisinternal
+GETTRIGGERS
+      my @triggers = @{$dbh->selectall_arrayref($sql, {Slice => {}}, $tableoid)};
+      add_st_test('triggers_are', {value => [map {$_->{name}} @triggers], type => 'name[]'});
+      for my $trigger (@triggers) {
+        add_st_test('has_trigger', $trigger->{name});
+      }
+      for my $trigger (@triggers) {
+        if ($printschema) {
+          add_st_test('trigger_is', $trigger->{name}, $trigger->{schema}, $trigger->{function});
+        } else {
+          add_st_test('trigger_is', $trigger->{name}, $trigger->{function});
+        }
+      }
+    }
+    end_table();
+  }
+
+  # Global stuff
+  start_global();
+  if (exists $global{TABLE}) {
+    add_comment('Tables');
+    while(my ($schema, $tables) = each %{$global{TABLE}}) {
+      add_schema_test('tables_are', $schema, $tables);
+    }
+    add_break();
+  }
+
+  if (exists $global{VIEW}) {
+    add_comment('Views');
+    while(my ($schema, $tables) = each %{$global{VIEW}}) {
+      add_schema_test('views_are', $schema, $tables);
+    }
+    add_break();
+  }
+
+  if (exists $global{'MATERIALIZED VIEW'}) {
+    add_comment('Materialized Views');
+    while(my ($schema, $tables) = each %{$global{'MATERIALIZED VIEW'}}) {
+      add_schema_test('materialized_views_are', $schema, $tables);
+    }
+    add_break();
+  }
+
+  # Pull types from catalog
+  my %types;
+  my %enums;
+  my %domains;
+  my %composites;
+  for my $type (@{$dbh->selectall_arrayref("select quote_ident(n.nspname) as schema, quote_ident(t.typname) as type, t.typtype as typtype from pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and n.nspname not in ('pg_catalog', 'information_schema')", {Slice => {}})}) {
+    next if $type->{schema} =~ $excludeschemas;
+    next unless $type->{schema} =~ $includeschemas;
+    push @{$types{$type->{schema}}}, $type->{type};
+    if($type->{typtype} eq 'd') {
+      push @{$domains{$type->{schema}}}, $type->{type};
+    } elsif($type->{typtype} eq 'e') {
+      push @{$enums{$type->{schema}}}, $type->{type};
+    } elsif($type->{typtype} eq 'c') {
+      push @{$composites{$type->{schema}}}, $type->{type};
+    }
+  }
+
+  if (%types) {
+    add_comment('Types');
+    while(my ($schema, $types) = each %types) {
+      add_schema_test('types_are', $schema, $types);
+      for my $t (@$types) {
+        add_schema_test('has_type', $schema, $t);
+      }
+    }
+    add_break();
+  }
+
+  if (%domains) {
+    add_comment('Domains');
+    while(my ($schema, $types) = each %domains) {
+      add_schema_test('domains_are', $schema, $types);
+      for my $t (@$types) {
+        add_schema_test('has_domain', $schema, $t);
+      }
+    }
+    add_break();
+  }
+
+  if (%enums) {
+    add_comment('Enums');
+    while(my ($schema, $types) = each %enums) {
+      add_schema_test('enums_are', $schema, $types);
+      for my $t (@$types) {
+        #      add_schema_test('has_enum', $schema, $t);
+        my ($labels) = $dbh->selectrow_array("select enum_range(null::" .
+                                               $dbh->quote_identifier($schema) .
+                                               '.' .
+                                               $dbh->quote_identifier($t) .
+                                               ")");
+        add_schema_test('enum_has_labels', $schema, $t, $labels);
+      }
+    }
+    add_break();
+  }
+
+  if (%composites) {
+    add_comment('Composites');
+    while(my ($schema, $types) = each %composites) {
+      for my $t (@$types) {
+        add_schema_test('has_composite', $schema, $t);
+      }
+    }
+    add_break();
+  }
+
+  # Functions
+  my @functions = grep { $_->{schema} !~ $excludeschemas && $_->{schema} =~ $includeschemas } @{$dbh->selectall_arrayref("select n.nspname as schema, proname as function, array(select unnest(proargtypes)::regtype) as args from pg_catalog.pg_namespace n join pg_catalog.pg_proc p on pronamespace = n.oid where nspname not in ('pg_catalog', 'information_schema')", {Slice => {}})};
+  if (@functions) {
+    add_comment('Functions');
+    my %func;
+    for my $rel (@functions) {
+      push @{$func{$rel->{schema}}}, $rel->{function};
+    }
+    while(my ($schema, $functions) = each %func) {
+      add_schema_test('functions_are', $schema, $functions);
+    }
+    for my $rel (@functions) {
+      add_schema_test('has_function', $rel->{schema}, $rel->{function},
+                      { value => $rel->{args}, type => 'name[]'});
+    }
+    add_break();
+  }
+
+  # Sequences
+  my @sequences = grep { $_->{schema} !~ $excludeschemas && $_->{schema} =~ $includeschemas } @{$dbh->selectall_arrayref("select quote_ident(sequence_schema) as schema, quote_ident(sequence_name) as sequence from information_schema.sequences where sequence_schema not in ('pg_catalog', 'information_schema')", {Slice => {}})};
+
+  if (@sequences) {
+    add_comment('Sequences');
+    my %s;
+    for my $rel (@sequences) {
+      push @{$s{$rel->{schema}}}, $rel->{sequence};
+    }
+    while(my ($schema, $sequences) = each %s) {
+      add_schema_test('sequences_are', $schema, $sequences);
+    }
+    for my $rel (@sequences) {
+      add_schema_test('has_sequence', $rel->{schema}, $rel->{sequence});
+    }
+    add_break();
+  }
+
+  end_global();
+  $dbh->rollback;
+};
+if ($@) {
+  my $err = $@;
+  $dbh->rollback;
+  $dbh->disconnect;
+  die $err;
+}
+
+# Convert an array reference of potentially wildcarded names to a regex
+sub flags_to_regex($$ ) {
+  my ($list, $deflt) = @_;
+  unless (defined $list) {
+    return qr/$deflt/;
+  }
+  my $wc2re = Regexp::Wildcards->new(type => $opts->{wildcard});
+  my $re = '^' . join('|', map { '(?:' . $wc2re->convert($_) .')'; } @$list) . '$';
+  return qr/$re/;
+}
+
+sub quote($ ) {
+  my $val = shift;
+  return $dbh->quote($val) unless ref($val);
+  if (ref($val) eq 'ARRAY') {
+    return 'ARRAY[' . join(', ', map { $dbh->quote($_) } @$val) . ']';
+  }
+  if (ref($val) eq 'HASH') {
+    die "Invalid hash passed to quote\n" unless exists $val->{value} && exists $val->{type};
+    return quote($val->{value}) . '::' . $val->{type};
+  }
+  die "Cannot quote $val\n";
+}
+
+sub current_table {
+  return quote($currenttable);
+}
+
+sub optional_schema {
+  if ($printschema) {
+    return quote($currentschema) . ', ';
+  }
+  return '';
+}
+
+sub add_st_test {
+  my $func = shift;
+  my @params = @_;
+  unshift @params, $currenttable;
+  unshift @params, $currentschema if $printschema;
+  unshift @params, $func;
+  add_test_params(@params);
+}
+
+sub add_schema_test {
+  my $func = shift;
+  my $schema = shift;
+  my @params = @_;
+  unshift @params, $schema if $printschema;
+  unshift @params, $func;
+  add_test_params(@params);
+}
+
+sub add_test_params {
+  my $func = shift;
+  return if $func =~ $excludechecks;
+  push @currenttests, "select $func(" . join(', ', map {quote($_)} @_) . ");";
+  $testcount++;
+}
+
+sub add_comment($ ) {
+  push @currenttests, '-- ' . shift;
+}
+
+sub add_break {
+  push @currenttests, '';
+}
+
+sub start_table($$ ) {
+  ($currentschema, $currenttable) = @_;
+  @currenttests = ();
+  $testcount = 0;
+  $tablecomment = undef;
+  if($printschema) {
+    $currentname = "$currentschema.$currenttable";
+  } else {
+    $currentname = $currenttable;
+  }
+}
+
+sub end_table {
+  my $o;
+  if (defined $opts->{prefix}) {
+    my $filename = $opts->{prefix};
+    if ($namecount{$currenttable} > 1) {
+      $filename .= $currentschema . '_' . $currenttable;
+    } else {
+      $filename .= $currenttable;
+    }
+    $filename .= '.pg';
+    open $o, '>', $filename or die "Failed to open $filename: $!\n";
+  } else {
+    $o = *STDOUT;
+  }
+  print $o "-- $currentname\n";
+  print $o "-- $tablecomment\n" if defined $tablecomment;
+  print $o "begin;\n";
+  print $o "select plan($testcount);\n";
+  foreach my $t (@currenttests) {
+    print $o "$t\n";
+  }
+  print $o "rollback;\n";
+  print $o "-- End of $currentname\n\n";
+}
+
+sub start_global {
+  ($currentschema, $currenttable) = @_;
+  @currenttests = ();
+  $testcount = 0;
+  $tablecomment = undef;
+}
+
+sub end_global {
+  my $o;
+  if (defined $opts->{prefix}) {
+    my $filename = $opts->{prefix} . 'schema.pg';
+    open $o, '>', $filename or die "Failed to open $filename: $!\n";
+  } else {
+    $o = *STDOUT;
+  }
+  print $o "-- Global tests\n";
+  print $o "begin;\n";
+  print $o "select plan($testcount);\n";
+  foreach my $t (@currenttests) {
+    print $o "$t\n";
+  }
+  print $o "rollback;\n";  
+  print $o "-- End of global tests\n\n";
+}
+
+
+__END__
+
+=encoding utf8
+
+whiskeytap - A tool for generating a pgTAP test set from an existing database
+
+=head1 Usage
+
+  whiskeytap -d testdb > tests.pg
+
+  whiskeytab --dbname testdb --prefix t/100
+  pg_prove -d testdb
+
+=head1 Description
+
+C<whiskeytap> is a command-line application to generate a
+L<pgTAP|http://pgtap.org/> test suite from a PostgreSQL database.
+
+C<whiskeytap> connects to a running database and generates pgTAP tests to cover
+a subset of the schema. For each table it writes tests for each
+column of the table, indexes, triggers, primary and foreign keys. It also
+writes tests for non-table related objects: types, enums, sequences and
+functions.
+
+By default C<whiskeytap> writes all tests to stdout, but if given a filename
+prefix with the C<--prefix> option it will write one test file for each
+table and one test file for other objects.
+
+=head1 Options
+
+ -d,  --dbname DBNAME         Database to which to connect.
+ -U,  --username USERNAME     User with which to connect.
+ -h,  --host HOST             Host to which to connect.
+ -p,  --port PORT             Port to which to connect.
+ -c,  --connect CONN          Connect to DBI data source instead of host/dbname
+
+ -n   --schema SCHEMA         Process only objects in schemas matching SCHEMA
+ -N   --exclude-schema SCHEMA Exclude objects in schemas matching SCHEMA
+ -t,  --table TABLE           Process only tables matching TABLE
+ -T,  --exclude-table TABLE   Exclude tables matching TABLE
+ -s,  --use-schemas           Use schemas in generated tests
+ -o,  --prefix PREFIX         Write tests to files starting with prefix
+ -x,  --exclude-check CHECK   Don't generate pgTAP checks matching CHECK
+
+ -H,  --help                  Print a usage statement and exit.
+ -?,                          Print a usage statement and exit.
+ -m,  --man                   Print the complete documentation and exit.
+ -V,  --version               Print the version number and exit.
+
+=head1 Bugs
+
+c<whiskeytap> works with schemas I write, but hasn't been tested with
+schemas with identifiers that need quoting. It likely quotes some
+identifiers too much or not enough.
+
+Test cases or patches welcome.
+
+=head1 Author
+
+Steve Atkins <steve@wordtothewise.com>
+
+L<https://github.com/wttw/whiskeytap>
+L<https://labs.wordtothewise.com/whiskeytap>
+
+=head1 Copyright
+
+Copyright (c) 2016 Steve Atkins. Released under Artistic License.
+
+=cut
