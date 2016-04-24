@@ -45,7 +45,7 @@ table and one test file for other objects.
 
 # Bugs
 
-c&lt;whiskeytap> works with schemas I write, but hasn't been tested with
+`whiskeytap` works with schemas I write, but hasn't been tested with
 schemas with identifiers that need quoting. It likely quotes some
 identifiers too much or not enough.
 
