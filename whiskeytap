@@ -156,7 +156,14 @@ eval {
         add_st_test('col_is_null', $name);
       }
       if (defined $col->{COLUMN_DEF}) {
-        add_st_test('col_default_is', $name, $col->{COLUMN_DEF});
+        my $deflt = $col->{COLUMN_DEF};
+        if ($deflt =~ /^(.*)::[a-z0-9_]+$/i) {
+          $deflt = $1;
+        }
+        if ($deflt =~ /^'(.*)'$/) {
+          $deflt = $1;
+        }
+        add_st_test('col_default_is', $name, $deflt);
       } else {
         add_st_test('col_hasnt_default', $name);
       }
@@ -247,7 +254,7 @@ GETINDEXES
 
       # Triggers
       my $sql = << "GETTRIGGERS";
-select quote_ident(t.tgname) as name, quote_ident(ni.nspname) as schema, quote_ident(p.proname) as function
+select t.tgname as name, ni.nspname as schema, p.proname as function
   from pg_catalog.pg_trigger t
   join pg_catalog.pg_class ct     on ct.oid = t.tgrelid
   join pg_catalog.pg_namespace nt on nt.oid = ct.relnamespace
@@ -425,7 +432,7 @@ sub quote($ ) {
   my $val = shift;
   return $dbh->quote($val) unless ref($val);
   if (ref($val) eq 'ARRAY') {
-    return 'ARRAY[' . join(', ', map { $dbh->quote($_) } @$val) . ']';
+    return 'ARRAY[' . join(', ', map { $dbh->quote($_) } @$val) . ']::text[]';
   }
   if (ref($val) eq 'HASH') {
     die "Invalid hash passed to quote\n" unless exists $val->{value} && exists $val->{type};
