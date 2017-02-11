@@ -4,7 +4,7 @@ whiskeytap - A tool for generating a pgTAP test set from an existing database
 
     whiskeytap -d testdb > tests.pg
 
-    whiskeytab --dbname testdb --prefix t/100
+    whiskeytap --dbname testdb --prefix t/100
     pg_prove -d testdb
 
 # Description
